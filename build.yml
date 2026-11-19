@@ -1,0 +1,281 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Generate project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_0'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "PresetImporter"
+          include(":app")
+          EOF_0
+          cat > build.gradle.kts <<'EOF_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_1
+          cat > gradle.properties <<'EOF_2'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          EOF_2
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.preset.importer"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.preset.importer"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          EOF_3
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <queries><package android:name="com.adobe.lrmobile" /></queries>
+              <application
+                  android:label="Preset Importer"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+              </application>
+          </manifest>
+          EOF_4
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/file_paths.xml <<'EOF_5'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <files-path name="presets" path="presets/" />
+          </paths>
+          EOF_5
+          mkdir -p app/src/main/java/com/preset/importer
+          cat > app/src/main/java/com/preset/importer/MainActivity.kt <<'EOF_6'
+          package com.preset.importer
+
+          import android.app.Activity
+          import android.content.ActivityNotFoundException
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.OpenableColumns
+          import android.view.Gravity
+          import android.widget.*
+          import androidx.core.content.FileProvider
+          import java.io.File
+          import java.util.zip.ZipInputStream
+
+          class MainActivity : Activity() {
+
+              private val LR = "com.adobe.lrmobile"
+              private val EXTS = listOf("dng", "xmp", "lrtemplate")
+              private val REQ = 42
+
+              private lateinit var status: TextView
+              private lateinit var list: ListView
+              private lateinit var adapter: ArrayAdapter<String>
+              private val files = mutableListOf<File>()
+              private val dir: File get() = File(filesDir, "presets").apply { mkdirs() }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  val title = TextView(this).apply {
+                      text = "Preset Importer"
+                      textSize = 24f
+                      gravity = Gravity.CENTER
+                  }
+                  val btnImport = Button(this).apply {
+                      text = "1. Import presets (DNG / XMP / ZIP)"
+                      setOnClickListener { pick() }
+                  }
+                  val btnAll = Button(this).apply {
+                      text = "2. Send all to Lightroom"
+                      setOnClickListener { send(files.toList()) }
+                  }
+                  status = TextView(this).apply {
+                      text = "Tap a preset to send it to Lightroom. Long-press to delete."
+                      setPadding(0, pad / 2, 0, pad / 2)
+                  }
+                  adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, mutableListOf())
+                  list = ListView(this).apply {
+                      adapter = this@MainActivity.adapter
+                      setOnItemClickListener { _, _, i, _ -> send(listOf(files[i])) }
+                      setOnItemLongClickListener { _, _, i, _ ->
+                          files[i].delete(); refresh(); true
+                      }
+                  }
+                  root.addView(title)
+                  root.addView(btnImport)
+                  root.addView(btnAll)
+                  root.addView(status)
+                  root.addView(list, LinearLayout.LayoutParams(-1, 0, 1f))
+                  setContentView(root)
+                  refresh()
+              }
+
+              private fun refresh() {
+                  files.clear()
+                  files.addAll(dir.listFiles()?.sortedBy { it.name.lowercase() } ?: emptyList())
+                  adapter.clear()
+                  adapter.addAll(files.map { it.name })
+                  adapter.notifyDataSetChanged()
+              }
+
+              private fun pick() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                      addCategory(Intent.CATEGORY_OPENABLE)
+                      type = "*/*"
+                      putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                  }
+                  startActivityForResult(i, REQ)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != REQ || resultCode != RESULT_OK || data == null) return
+                  val uris = mutableListOf<Uri>()
+                  data.clipData?.let { c -> for (i in 0 until c.itemCount) uris.add(c.getItemAt(i).uri) }
+                  data.data?.let { uris.add(it) }
+                  var count = 0
+                  for (u in uris) count += importUri(u)
+                  refresh()
+                  status.text = if (count > 0) "Imported $count preset(s)."
+                  else "No DNG/XMP/lrtemplate files found."
+              }
+
+              private fun nameOf(u: Uri): String {
+                  contentResolver.query(u, null, null, null, null)?.use {
+                      if (it.moveToFirst()) {
+                          val idx = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                          if (idx >= 0) return it.getString(idx)
+                      }
+                  }
+                  return u.lastPathSegment ?: "preset"
+              }
+
+              private fun importUri(u: Uri): Int {
+                  val name = nameOf(u)
+                  val ext = name.substringAfterLast('.', "").lowercase()
+                  return try {
+                      when {
+                          ext == "zip" -> unzip(u)
+                          ext in EXTS -> {
+                              contentResolver.openInputStream(u)?.use { ins ->
+                                  File(dir, name).outputStream().use { ins.copyTo(it) }
+                              }
+                              1
+                          }
+                          else -> 0
+                      }
+                  } catch (e: Exception) { 0 }
+              }
+
+              private fun unzip(u: Uri): Int {
+                  var n = 0
+                  contentResolver.openInputStream(u)?.use { raw ->
+                      ZipInputStream(raw).use { zip ->
+                          var e = zip.nextEntry
+                          while (e != null) {
+                              val fname = File(e.name).name
+                              if (!e.isDirectory && !fname.startsWith(".") &&
+                                  fname.substringAfterLast('.', "").lowercase() in EXTS) {
+                                  File(dir, fname).outputStream().use { zip.copyTo(it) }
+                                  n++
+                              }
+                              e = zip.nextEntry
+                          }
+                      }
+                  }
+                  return n
+              }
+
+              private fun mime(f: File) = when (f.extension.lowercase()) {
+                  "dng" -> "image/x-adobe-dng"
+                  else -> "application/octet-stream"
+              }
+
+              private fun send(sel: List<File>) {
+                  if (sel.isEmpty()) { toast("Import presets first."); return }
+                  val uris = ArrayList(sel.map {
+                      FileProvider.getUriForFile(this, "$packageName.fileprovider", it)
+                  })
+                  val intent = if (uris.size == 1) Intent(Intent.ACTION_SEND).apply {
+                      putExtra(Intent.EXTRA_STREAM, uris[0])
+                      type = mime(sel[0])
+                  } else Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                      putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                      type = if (sel.all { it.extension.equals("dng", true) }) "image/x-adobe-dng" else "*/*"
+                  }
+                  intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  try {
+                      startActivity(Intent(intent).setPackage(LR))
+                  } catch (e: ActivityNotFoundException) {
+                      toast("Lightroom couldn't open it directly. Pick it from the list.")
+                      startActivity(Intent.createChooser(intent, "Open with"))
+                  }
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+          }
+          EOF_6
+      - name: Build
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PresetImporter-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
